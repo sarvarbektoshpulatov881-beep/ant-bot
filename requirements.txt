@@ -1,0 +1,4 @@
+aiogram>=3.7,<4
+python-dotenv>=1.0
+tzdata
+openpyxl>=3.1
