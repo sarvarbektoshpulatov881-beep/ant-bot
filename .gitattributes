@@ -1,0 +1,6 @@
+# Linux skriptlari har doim Linux qator oxiri (LF) bilan saqlansin
+*.sh   text eol=lf
+*.py   text eol=lf
+*.txt  text eol=lf
+# Windows skripti — Windows qator oxiri (CRLF)
+*.bat  text eol=crlf

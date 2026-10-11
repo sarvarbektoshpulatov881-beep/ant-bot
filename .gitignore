@@ -1,8 +1,14 @@
+# MAXFIY — GitHubga hech qachon chiqmasin
 .env
 *.db
 *.db-journal
+
+# Excel/CSV eksportlar (mijozlar ma'lumoti)
 *.xlsx
 *.csv
+
+# Python ortiqcha fayllari
 __pycache__/
 *.pyc
 venv/
+.venv/

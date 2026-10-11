@@ -16,9 +16,11 @@ import html
 import io
 import logging
 import os
+import platform
 import re
 import secrets
 import sqlite3
+import tempfile
 from contextlib import closing
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -53,6 +55,7 @@ CHECK_AFTER_MINUTES = int(os.getenv("CHECK_AFTER_MINUTES", "60"))  # "mijoz keld
 DB_PATH = os.getenv("DB_PATH", "ant_bot.db")
 # Bot egasi. Bo'sh bo'lsa — botga birinchi /start yozgan odam egasi bo'ladi
 OWNER_ID = int(os.getenv("OWNER_ID", "0").strip() or 0)
+BACKUP_DAILY = os.getenv("BACKUP_DAILY", "1").strip() != "0"     # har kuni hisobotdan keyin bazani egasiga yuborish
 
 FMT = "%Y-%m-%d %H:%M"
 MONTHS = ["yanvar", "fevral", "mart", "aprel", "may", "iyun", "iyul",
@@ -104,7 +107,8 @@ HELP_SELLER = (
 )
 HELP_OWNER = HELP.replace("<b>🎧 Operator</b>", "<b>👑 Egasi</b>") + (
     f"\n{BTN_REPORT} — kunlik/haftalik/oylik hisobot va Excel\n"
-    f"{BTN_ADMINS} — operator va sotuvchilarni qo'shish/boshqarish\n\n"
+    f"{BTN_ADMINS} — operator va sotuvchilarni qo'shish/boshqarish\n"
+    "/zaxira — bazaning zaxira nusxasi (tiklash: faylni botga qayta yuborasiz)\n\n"
     "Siz sotuvchi tugmalarini ham bosa olasiz. Har kuni "
     f"{REPORT_TIME} da sizga kunlik hisobot keladi."
 )
@@ -724,7 +728,53 @@ def report_kb():
         [InlineKeyboardButton(text="Oxirgi 7 kun", callback_data="rep:week"),
          InlineKeyboardButton(text="Shu oy", callback_data="rep:month")],
         [InlineKeyboardButton(text="📥 Excel (tashriflar + mijozlar reytingi)", callback_data="xls")],
+        [InlineKeyboardButton(text="💾 Zaxira nusxa (baza fayli)", callback_data="bkp")],
     ])
+
+
+# ================================================================ zaxira nusxa va tiklash
+def db_snapshot_bytes():
+    """Ishlab turgan bazaning xavfsiz nusxasi (SQLite backup API)."""
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as src, closing(sqlite3.connect(tmp)) as dst:
+            src.backup(dst)
+        with open(tmp, "rb") as f:
+            return f.read()
+    finally:
+        os.remove(tmp)
+
+
+def inspect_db(path):
+    """Fayl haqiqatan bot bazasimi? Ha bo'lsa — qisqa ma'lumot, aks holda None."""
+    try:
+        with closing(sqlite3.connect(path)) as con:
+            if con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                return None
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not {"visits", "meta"} <= tables:
+                return None
+            cnt, last = con.execute("SELECT COUNT(*), MAX(visit_at) FROM visits").fetchone()
+            team = con.execute("SELECT COUNT(*) FROM admins").fetchone()[0] if "admins" in tables else 0
+            return {"visits": cnt, "last": last, "team": team}
+    except sqlite3.DatabaseError:
+        return None
+
+
+def db_stats_text(info):
+    last = fmt_dt(datetime.strptime(info["last"], FMT)) if info.get("last") else "—"
+    return f"Tashriflar: <b>{info['visits']}</b> · Jamoa: <b>{info['team']}</b> · Oxirgi tashrif: {last}"
+
+
+async def send_backup(bot, chat_id, title="💾 <b>Zaxira nusxa</b>"):
+    data = db_snapshot_bytes()
+    name = f"ant_bot_backup_{now_local():%Y-%m-%d_%H%M}.db"
+    info = inspect_db(DB_PATH) or {"visits": 0, "team": 0, "last": None}
+    await bot.send_document(
+        chat_id, BufferedInputFile(data, filename=name),
+        caption=f"{title} — {fmt_dt(now_local())}\n{db_stats_text(info)}\n\n"
+                "Bazani tiklash kerak bo'lsa, shu faylni botga qayta yuboring.")
 
 
 # ================================================================ holatlar
@@ -1440,6 +1490,101 @@ async def st_amount(m: Message):
                                  f"({esc(m.from_user.full_name)})")
 
 
+# ================================================================ egasi: zaxira va tiklash
+_pending_restore = {}   # token -> vaqtinchalik fayl yo'li
+
+
+@router.callback_query(F.data == "bkp")
+async def cb_backup(c: CallbackQuery):
+    if not is_owner(c.from_user.id):
+        await c.answer("Faqat bot egasi uchun", show_alert=True)
+        return
+    await c.answer("Tayyorlanmoqda...")
+    await send_backup(c.bot, c.from_user.id)
+
+
+@router.message(Command("zaxira"), F.chat.type == "private")
+async def cmd_backup(m: Message):
+    if not is_owner(m.from_user.id):
+        await m.answer("Zaxira nusxa faqat bot egasi uchun.") if is_admin(m.from_user.id) else await deny(m)
+        return
+    await send_backup(m.bot, m.from_user.id)
+
+
+@router.message(F.chat.type == "private", F.document)
+async def on_document(m: Message):
+    if not is_owner(m.from_user.id):
+        await fallback(m)
+        return
+    doc = m.document
+    if not (doc.file_name or "").lower().endswith(".db"):
+        await m.answer("Bu faylni tushunmadim. Bazani tiklash uchun botning zaxira faylini (<b>.db</b>) yuboring.")
+        return
+    if (doc.file_size or 0) > 20 * 1024 * 1024:
+        await m.answer("Fayl juda katta (20 MB dan ortiq).")
+        return
+    folder = os.path.dirname(os.path.abspath(DB_PATH))
+    fd, tmp = tempfile.mkstemp(suffix=".restore", dir=folder)
+    os.close(fd)
+    try:
+        await m.bot.download(doc, destination=tmp)
+    except Exception:
+        os.remove(tmp)
+        logging.exception("Faylni yuklab olishda xato")
+        await m.answer("❌ Faylni yuklab bo'lmadi, qaytadan yuboring.")
+        return
+    info = inspect_db(tmp)
+    if not info:
+        os.remove(tmp)
+        await m.answer("❌ Bu fayl bot bazasi emas yoki buzilgan.")
+        return
+    token = secrets.token_hex(4)
+    _pending_restore[token] = tmp
+    cur = inspect_db(DB_PATH) or {"visits": 0, "team": 0, "last": None}
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Ha, tiklash", callback_data=f"rst:ok:{token}"),
+        InlineKeyboardButton(text="❌ Yo'q", callback_data=f"rst:no:{token}"),
+    ]])
+    await m.answer(f"📦 <b>Fayl tekshirildi</b>\n{db_stats_text(info)}\n\n"
+                   f"Hozirgi baza: {db_stats_text(cur)}\n\n"
+                   "⚠️ Hozirgi baza shu fayl bilan <b>almashtiriladi</b> (hozirgisi alohida nusxa qilib "
+                   "saqlab qo'yiladi). Davom etamizmi?", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("rst:"))
+async def cb_restore(c: CallbackQuery):
+    if not is_owner(c.from_user.id):
+        await c.answer("Faqat bot egasi uchun", show_alert=True)
+        return
+    _, action, token = c.data.split(":")
+    path = _pending_restore.pop(token, None)
+    await c.answer()
+    await c.message.edit_reply_markup(reply_markup=None)
+    if action != "ok" or not path or not os.path.exists(path):
+        if path and os.path.exists(path):
+            os.remove(path)
+        await c.message.answer("Bekor qilindi." if action != "ok" else "⚠️ So'rov eskirgan. Faylni qaytadan yuboring.")
+        return
+    if not inspect_db(path):
+        os.remove(path)
+        await c.message.answer("❌ Fayl buzilgan, tiklanmadi.")
+        return
+    # hozirgi bazani alohida saqlab qo'yamiz
+    folder = os.path.dirname(os.path.abspath(DB_PATH))
+    old = os.path.join(folder, f"ant_bot_before_restore_{now_local():%Y%m%d_%H%M}.db")
+    with closing(sqlite3.connect(DB_PATH)) as src, closing(sqlite3.connect(old)) as dst:
+        src.backup(dst)
+    os.replace(path, DB_PATH)
+    init_db()
+    if not OWNER_ID:
+        set_meta("owner_id", str(c.from_user.id))  # tiklagan odam egaligicha qoladi
+    info = inspect_db(DB_PATH)
+    logging.info("Baza zaxira fayldan tiklandi. Eski baza: %s", old)
+    await c.message.answer(f"✅ <b>Baza tiklandi!</b>\n{db_stats_text(info)}\n\n"
+                           f"Oldingi baza saqlandi: <code>{esc(os.path.basename(old))}</code>",
+                           reply_markup=kb_for(c.from_user.id))
+
+
 @router.message(F.chat.type == "private")
 async def fallback(m: Message):
     if not is_admin(m.from_user.id):
@@ -1503,11 +1648,16 @@ async def tick(bot, now=None):
 
     # 4) kechki hisobot (egasiga)
     if (now.hour, now.minute) >= _hm(REPORT_TIME) and get_meta("evening") != today:
+        set_meta("evening", today)
         owner = owner_id()
         if owner:
             await send_private(bot, owner, "🌙 <b>Kunlik hisobot</b>\n\n" + build_report(now.date(), now.date()),
                                report_kb())
-        set_meta("evening", today)
+            if BACKUP_DAILY:
+                try:
+                    await send_backup(bot, owner, "💾 <b>Kunlik zaxira nusxa</b>")
+                except Exception:
+                    logging.exception("Kunlik zaxira nusxani yuborishda xato")
 
 
 async def scheduler(bot):
@@ -1520,6 +1670,20 @@ async def scheduler(bot):
 
 
 # ================================================================ ishga tushirish
+async def announce_start(bot):
+    """Egasiga: bot qayerda ishga tushganini bildirish (10 daqiqada ko'pi bilan 1 marta)."""
+    owner = owner_id()
+    now = now_local()
+    last = get_meta("start_notice")
+    if not owner or (last and now - datetime.strptime(last, FMT) < timedelta(minutes=10)):
+        return
+    set_meta("start_notice", now.strftime(FMT))
+    await send_private(bot, owner, f"🟢 <b>Bot ishga tushdi</b>\n🖥 Qayerda: <b>{esc(platform.node())}</b>\n"
+                                   f"🕐 {fmt_dt(now)}\n\n"
+                                   "Agar bunday xabar ikki xil joydan kelsa — bot ikki joyda ishlayapti, "
+                                   "bittasini o'chiring.")
+
+
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if not BOT_TOKEN:
@@ -1543,9 +1707,11 @@ async def main():
         BotCommand(command="royxat", description="Kelgusi tashriflar"),
         BotCommand(command="hisobot", description="Hisobot (egasi)"),
         BotCommand(command="adminlar", description="Jamoa (egasi)"),
+        BotCommand(command="zaxira", description="Bazaning zaxira nusxasi (egasi)"),
         BotCommand(command="bekor", description="Kiritishni to'xtatish"),
         BotCommand(command="id", description="Chat ID"),
     ])
+    await announce_start(bot)
     reminder_task = asyncio.create_task(scheduler(bot))
     try:
         await dp.start_polling(bot)
